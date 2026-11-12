@@ -1,0 +1,20 @@
+{
+  "domain": "zappistant",
+  "name": "Zappistant",
+  "after_dependencies": [
+    "myenergi"
+  ],
+  "codeowners": [
+    "@adamkcs"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "websocket_api"
+  ],
+  "documentation": "https://github.com/adamkcs/ha-zappistant-integration",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/adamkcs/ha-zappistant-integration/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
