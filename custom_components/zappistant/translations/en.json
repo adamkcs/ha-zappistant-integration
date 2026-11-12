@@ -9,14 +9,14 @@
           "session_entity": "Charge added session sensor",
           "plug_entity": "Plug status sensor",
           "status_entity": "Status sensor",
-          "switch_to_stopped": "Switch to Stopped when a scheduled charge starts",
+          "switch_to_stopped": "Switch to Stopped when a scheduled charge ends",
           "charge_rate": "Charging power (kW)",
           "control_mode": "Who controls charging"
         },
         "data_description": {
           "charge_rate": "Used to estimate charging slots for Predbat. 7.0 for a single-phase zappi, 22.0 for three-phase.",
           "control_mode": "Zappistant boosts the zappi in your slots, or Intelligent Octopus Go charges and Zappistant only sets Octopus's charge target and ready-by time.",
-          "switch_to_stopped": "Zappi control only. Without this the zappi keeps charging in its own mode outside your slots. Octopus control always leaves the zappi in Eco+."
+          "switch_to_stopped": "Zappi control only. A zappi can only boost in Eco or Eco+, so Zappistant switches to Eco+ to charge. With this on it switches to Stopped when the slot ends or the kWh are in, so the zappi doesn't carry on charging from surplus solar outside your slots. Octopus control always leaves the zappi in Eco+."
         }
       },
       "octopus": {
@@ -45,12 +45,12 @@
     "step": {
       "init": {
         "data": {
-          "switch_to_stopped": "Switch to Stopped when a scheduled charge starts",
+          "switch_to_stopped": "Switch to Stopped when a scheduled charge ends",
           "charge_rate": "Charging power (kW)",
           "control_mode": "Who controls charging"
         },
         "data_description": {
-          "switch_to_stopped": "Zappi control only. Without this the zappi keeps charging in its own mode outside your slots. Octopus control always leaves the zappi in Eco+.",
+          "switch_to_stopped": "Zappi control only. A zappi can only boost in Eco or Eco+, so Zappistant switches to Eco+ to charge. With this on it switches to Stopped when the slot ends or the kWh are in, so the zappi doesn't carry on charging from surplus solar outside your slots. Octopus control always leaves the zappi in Eco+.",
           "charge_rate": "Used to estimate charging slots for Predbat. 7.0 for a single-phase zappi, 22.0 for three-phase.",
           "control_mode": "Zappistant boosts the zappi in your slots, or Intelligent Octopus Go charges and Zappistant only sets Octopus's charge target and ready-by time."
         }

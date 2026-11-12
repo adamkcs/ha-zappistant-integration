@@ -65,6 +65,8 @@ BOOST_RETRY = timedelta(minutes=5)
 MIN_BOOST_KWH = 1
 MAX_BOOST_KWH = 99
 UNPLUGGED = {"", "EV Disconnected"}
+# A zappi only accepts a boost in these modes; the myenergi integration silently ignores it otherwise.
+BOOST_MODES = ("Eco", "Eco+")
 # A boost now that the zappi hasn't been running for this long has finished or been stopped.
 MANUAL_BOOST_GRACE = timedelta(minutes=10)
 # Octopus's entities update from its API, so give a change time to show before setting it again.
@@ -157,13 +159,13 @@ class ScheduleController:
     async def async_boost(
         self, kind: str, kwh: float, ready_by: str | None = None, switch_to_stopped: bool = False
     ) -> None:
-        """Start a boost now or a smart boost, and add it to the charging plan."""
+        """Start a boost now or a smart boost, and add it to the charging plan.
+
+        switch_to_stopped: once the boost is over, switch the zappi to Stopped so it ends at the
+        boost's kWh rather than carrying on in Eco+ (never in Octopus mode, which needs Eco+).
+        """
         now = dt_util.now()
-        # Octopus needs the zappi left in Eco+ to control it.
-        if self.octopus_mode:
-            switch_to_stopped = False
-        if switch_to_stopped and self._state(self.mode_entity) not in (None, "Stopped"):
-            await self._async_call("select", "select_option", {"option": "Stopped"})
+        await self._async_ready_for_boost()
         if kind == BOOST_SMART:
             if not ready_by:
                 raise ValueError("Smart boost needs a ready-by time")
@@ -182,12 +184,15 @@ class ScheduleController:
                 started=now.isoformat(),
                 ready_by=deadline.isoformat() if deadline else None,
                 last_session=self._float_state(self.session_entity),
+                stop_after=switch_to_stopped and not self.octopus_mode,
             )
         ]
         await self.async_update()
 
     async def async_stop_boost(self) -> None:
         await self._async_call(MYENERGI_DOMAIN, "myenergi_stop_boost", {})
+        if any(boost.stop_after for boost in self.boosts):
+            await self._async_set_stopped()
         self.boosts = []
         await self.async_update()
 
@@ -211,7 +216,8 @@ class ScheduleController:
             for start, end, kwh in slots
         ]
 
-    def _update_boosts(self, now: datetime) -> None:
+    def _update_boosts(self, now: datetime) -> bool:
+        """Track boosts' progress and drop finished ones. True if one that should end in Stopped ended."""
         session = self._float_state(self.session_entity)
         unplugged = self._state(self.plug_entity) in UNPLUGGED
         boosting = self._state(self.status_entity) == "Boosting"
@@ -225,7 +231,9 @@ class ScheduleController:
             )
             if not (boost.finished(now) or unplugged or idle_manual):
                 kept.append(boost)
+        ended = [boost for boost in self.boosts if boost not in kept]
         self.boosts = kept
+        return any(boost.stop_after for boost in ended)
 
     async def async_set_enabled(self, enabled: bool) -> None:
         self.schedule = {**self.schedule, "enabled": enabled}
@@ -265,8 +273,10 @@ class ScheduleController:
             # Yesterday's override can still matter while its charge overruns past midnight.
             oldest = (now.date() - timedelta(days=1)).isoformat()
             self.overrides = {day: o for day, o in self.overrides.items() if day >= oldest}
-            self._update_boosts(now)
+            stop_after_boost = self._update_boosts(now)
             try:
+                if stop_after_boost:
+                    await self._async_set_stopped()
                 if self.octopus_mode:
                     self.run = None
                     self.decision = Decision(STATE_OCTOPUS if self.schedule["enabled"] else STATE_DISABLED)
@@ -289,13 +299,6 @@ class ScheduleController:
         plug = self._state(self.plug_entity)
         plugged = plug is not None and plug not in UNPLUGGED
 
-        if decision.run_started and self.switch_to_stopped and self._state(self.mode_entity) not in (
-            None,
-            "Stopped",
-        ):
-            # Without this the zappi keeps charging in its own mode outside the slots.
-            await self._async_call("select", "select_option", {"option": "Stopped"})
-
         if decision.charge:
             retry_due = self._last_boost_call is None or now - self._last_boost_call >= BOOST_RETRY
             if plugged and not boosting and retry_due:
@@ -303,13 +306,29 @@ class ScheduleController:
                 self._last_boost_call = now
                 self._boost_started = True
                 _LOGGER.info("Starting scheduled boost of %s kWh", amount)
+                await self._async_ready_for_boost()
                 await self._async_call(MYENERGI_DOMAIN, "myenergi_boost", {"amount": amount})
         elif self._boost_started:
+            # The slot ended or the kWh are in.
             self._boost_started = False
             self._last_boost_call = None
             if boosting:
                 _LOGGER.info("Stopping scheduled boost (%s)", decision.state)
                 await self._async_call(MYENERGI_DOMAIN, "myenergi_stop_boost", {})
+            if self.switch_to_stopped:
+                # Otherwise the zappi carries on in Eco+ (from surplus solar) outside the slots.
+                await self._async_set_stopped()
+
+    async def _async_ready_for_boost(self) -> None:
+        """Switch to Eco+ if needed: a zappi only boosts in Eco or Eco+."""
+        if self._state(self.mode_entity) not in BOOST_MODES:
+            _LOGGER.info("Switching the zappi to Eco+ so it can boost")
+            await self._async_call("select", "select_option", {"option": "Eco+"})
+
+    async def _async_set_stopped(self) -> None:
+        if self._state(self.mode_entity) not in (None, "Stopped"):
+            _LOGGER.info("Switching the zappi to Stopped")
+            await self._async_call("select", "select_option", {"option": "Stopped"})
 
     async def _async_sync_octopus(self, now: datetime) -> None:
         """Keep Octopus's charge target and ready-by time set for the upcoming charge."""

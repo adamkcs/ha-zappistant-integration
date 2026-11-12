@@ -119,19 +119,35 @@ async def test_boosts_in_slot_and_stops_at_slot_end(
     assert not calls["boost"]
 
     await _move_to(hass, freezer, datetime(2026, 11, 10, 22, 0, 30, tzinfo=dt_util.UTC))
-    assert [c.data["option"] for c in calls["select"]] == ["Stopped"]
+    # Already in Eco+, which can boost, so the mode is left alone.
+    assert not calls["select"]
     assert [c.data["amount"] for c in calls["boost"]] == [10]
     assert calls["boost"][0].data["entity_id"] == MODE
     assert hass.states.get(SCHEDULE_STATUS).state == "charging"
 
     # The zappi reports the boost; 4 kWh go in before the slot ends.
-    _set_charger(hass, mode="Stopped", status="Boosting", plug="Charging", session=4.0)
+    _set_charger(hass, mode="Eco+", status="Boosting", plug="Charging", session=4.0)
     await hass.async_block_till_done()
     assert hass.states.get(SCHEDULE_STATUS).attributes["delivered_kwh"] == 4.0
 
+    # At the slot's end the boost is stopped and the zappi switched to Stopped, so it doesn't
+    # carry on in Eco+.
     await _move_to(hass, freezer, datetime(2026, 11, 10, 23, 0, 30, tzinfo=dt_util.UTC))
     assert len(calls["stop"]) == 1
+    assert [c.data["option"] for c in calls["select"]] == ["Stopped"]
     assert hass.states.get(SCHEDULE_STATUS).state == "ended"
+
+
+async def test_switches_to_eco_plus_to_boost(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, setup
+) -> None:
+    """A zappi ignores a boost in Stopped (or Fast), so the slot first switches it to Eco+."""
+    calls, save, _client = setup
+    _set_charger(hass, mode="Stopped")
+    await save(_schedule([{"start": "22:00", "end": "23:00"}]))
+    await _move_to(hass, freezer, datetime(2026, 11, 10, 22, 0, 30, tzinfo=dt_util.UTC))
+    assert [c.data["option"] for c in calls["select"]] == ["Eco+"]
+    assert [c.data["amount"] for c in calls["boost"]] == [10]
 
 
 async def test_overrun_keeps_charging_until_kwh(
@@ -140,18 +156,20 @@ async def test_overrun_keeps_charging_until_kwh(
     calls, save, _client = setup
     await save(_schedule([{"start": "22:00", "end": "23:00", "overrun": True}]))
     await _move_to(hass, freezer, datetime(2026, 11, 10, 22, 0, 30, tzinfo=dt_util.UTC))
-    _set_charger(hass, mode="Stopped", status="Boosting", plug="Charging", session=6.0)
+    _set_charger(hass, mode="Eco+", status="Boosting", plug="Charging", session=6.0)
     await hass.async_block_till_done()
 
     await _move_to(hass, freezer, datetime(2026, 11, 10, 23, 30, tzinfo=dt_util.UTC))
     assert not calls["stop"]
+    assert not calls["select"]
     assert hass.states.get(SCHEDULE_STATUS).state == "overrun"
 
-    # The zappi finishes the boost by itself once the kWh are in.
-    _set_charger(hass, mode="Stopped", status="Paused", plug="EV Connected", session=10.0)
+    # The zappi finishes the boost by itself once the kWh are in; then it's switched to Stopped.
+    _set_charger(hass, mode="Eco+", status="Paused", plug="EV Connected", session=10.0)
     await hass.async_block_till_done()
     assert hass.states.get(SCHEDULE_STATUS).state == "done"
     assert not calls["stop"]  # nothing to stop: the zappi isn't boosting
+    assert [c.data["option"] for c in calls["select"]] == ["Stopped"]
     assert len(calls["boost"]) == 1
 
 
@@ -164,6 +182,7 @@ async def test_waits_while_unplugged(hass: HomeAssistant, freezer: FrozenDateTim
 
     _set_charger(hass, mode="Stopped", plug="EV Connected")
     await hass.async_block_till_done()
+    assert [c.data["option"] for c in calls["select"]] == ["Eco+"]
     assert [c.data["amount"] for c in calls["boost"]] == [10]
 
 
@@ -224,7 +243,7 @@ async def test_boosts_through_zappistant_join_the_plan(
         {"type": "zappistant/boost", "kind": "smart", "kwh": 14, "ready_by": "07:00", "switch_to_stopped": True}
     )
     assert (await client.receive_json())["success"]
-    assert [c.data["option"] for c in calls["select"]] == ["Stopped"]
+    assert not calls["select"]  # already in Eco+; Stopped only comes after the boost
     assert calls["smart"][0].data["amount"] == 14
     assert calls["smart"][0].data["when"] == "07:00"
     dispatches = hass.states.get(CHARGE_SLOT).attributes["planned_dispatches"]
@@ -244,6 +263,36 @@ async def test_boosts_through_zappistant_join_the_plan(
     assert (await client.receive_json())["success"]
     assert len(calls["stop"]) == 1
     assert hass.states.get(CHARGE_SLOT).attributes["planned_dispatches"] == []
+
+
+async def test_card_boost_switches_to_eco_plus_then_stopped(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, setup
+) -> None:
+    calls, _save, client = setup
+    _set_charger(hass, mode="Stopped")
+    await client.send_json_auto_id(
+        {"type": "zappistant/boost", "kind": "smart", "kwh": 14, "ready_by": "07:00", "switch_to_stopped": True}
+    )
+    assert (await client.receive_json())["success"]
+    assert [c.data["option"] for c in calls["select"]] == ["Eco+"]
+    assert calls["smart"][0].data["amount"] == 14
+
+    # Once it's done (here: the ready-by time passes), the zappi goes to Stopped.
+    _set_charger(hass, mode="Eco+")
+    await _move_to(hass, freezer, datetime(2026, 11, 11, 7, 0, 30, tzinfo=dt_util.UTC))
+    assert [c.data["option"] for c in calls["select"]] == ["Eco+", "Stopped"]
+
+
+async def test_stop_button_switches_to_stopped_after_target_boost(hass: HomeAssistant, setup) -> None:
+    calls, _save, client = setup
+    await client.send_json_auto_id(
+        {"type": "zappistant/boost", "kind": "manual", "kwh": 7, "switch_to_stopped": True}
+    )
+    assert (await client.receive_json())["success"]
+    await client.send_json_auto_id({"type": "zappistant/boost/stop"})
+    assert (await client.receive_json())["success"]
+    assert len(calls["stop"]) == 1
+    assert [c.data["option"] for c in calls["select"]] == ["Stopped"]
 
 
 async def test_boost_dropped_when_unplugged(hass: HomeAssistant, setup) -> None:

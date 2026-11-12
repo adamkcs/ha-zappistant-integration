@@ -363,6 +363,8 @@ class Boost:
     started: str
     # Smart boost only: when the charge must be finished.
     ready_by: str | None = None
+    # Switch the zappi to Stopped once the boost is over, so charging ends at its kWh.
+    stop_after: bool = False
     delivered: float = 0.0
     last_session: float | None = None
 

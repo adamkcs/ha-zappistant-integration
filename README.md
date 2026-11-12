@@ -58,10 +58,11 @@ counts delivered energy across midnight. The next day's own charge is its remain
 
 Zappistant runs the plan:
 
-- At the start of the day's first slot it switches the zappi to Stopped (an option, on by default) so
-  it doesn't charge outside the slots.
-- In each slot it starts a boost for the kWh still needed, if the car is plugged in.
-- At the end of a slot it stops the boost, unless that interval keeps charging after.
+- In each slot it starts a boost for the kWh still needed, if the car is plugged in. A zappi only
+  boosts in Eco or Eco+ (it ignores a boost in Stopped or Fast), so it switches to Eco+ first if needed.
+- At the end of a slot it stops the boost, unless that interval keeps charging after, and switches the
+  zappi to Stopped (an option, on by default) so it doesn't carry on charging from surplus solar
+  outside your slots. The same happens once the day's kWh are in.
 - It counts kWh delivered from the zappi's session energy sensor, so a day's later slots only add
   what's still missing. An overrun is dropped if it hasn't finished by the end of the next day.
 
