@@ -134,6 +134,11 @@ In Octopus mode:
 
 ## Development
 
+To try a change before releasing it, `scripts/deploy.sh` copies the integration over SSH into Home
+Assistant and restarts it (after a configuration check). Copy `.deploy.env.example` to `.deploy.env`
+and set your host first. `--no-restart` skips the restart and `--dry-run` shows what it would do.
+The next HACS update restores the release.
+
 Tests run the scheduling logic on its own and the integration inside Home Assistant (Python 3.13):
 
 ```sh
