@@ -67,6 +67,10 @@ MAX_BOOST_KWH = 99
 UNPLUGGED = {"", "EV Disconnected"}
 # A zappi only accepts a boost in these modes; the myenergi integration silently ignores it otherwise.
 BOOST_MODES = ("Eco", "Eco+")
+# A zappi takes a while to apply a mode change, and the myenergi integration only reads its real
+# mode once a minute, so a boost sent straight after switching can be lost. Wait longer than one
+# poll, then check the zappi reports the new mode before boosting.
+MODE_SETTLE = timedelta(seconds=75)
 # A boost now that the zappi hasn't been running for this long has finished or been stopped.
 MANUAL_BOOST_GRACE = timedelta(minutes=10)
 # Octopus's entities update from its API, so give a change time to show before setting it again.
@@ -106,6 +110,9 @@ class ScheduleController:
         # Only stop boosts this controller started, never one the user started by hand.
         self._boost_started = False
         self._last_boost_call: datetime | None = None
+        self._mode_switched_at: datetime | None = None
+        # What Zappistant last asked the zappi to do, shown on the status sensor.
+        self.last_action: dict[str, str] | None = None
         self._lock = asyncio.Lock()
         self._listeners: list[Callable[[], None]] = []
         self._unsubs: list[CALLBACK_TYPE] = []
@@ -165,18 +172,11 @@ class ScheduleController:
         boost's kWh rather than carrying on in Eco+ (never in Octopus mode, which needs Eco+).
         """
         now = dt_util.now()
-        await self._async_ready_for_boost()
-        if kind == BOOST_SMART:
-            if not ready_by:
-                raise ValueError("Smart boost needs a ready-by time")
-            deadline = ready_by_time(now, ready_by)
-            await self._async_call(
-                MYENERGI_DOMAIN, "myenergi_smart_boost", {"amount": kwh, "when": deadline.strftime("%H:%M")}
-            )
-        else:
-            deadline = None
-            await self._async_call(MYENERGI_DOMAIN, "myenergi_boost", {"amount": kwh})
-        # A new boost replaces the zappi's previous one.
+        if kind == BOOST_SMART and not ready_by:
+            raise ValueError("Smart boost needs a ready-by time")
+        deadline = ready_by_time(now, ready_by) if kind == BOOST_SMART and ready_by else None
+        # A new boost replaces the zappi's previous one. It's sent to the zappi straight away if it
+        # can boost now, otherwise by async_update() once it has switched to Eco+.
         self.boosts = [
             Boost(
                 kind=kind,
@@ -185,6 +185,7 @@ class ScheduleController:
                 ready_by=deadline.isoformat() if deadline else None,
                 last_session=self._float_state(self.session_entity),
                 stop_after=switch_to_stopped and not self.octopus_mode,
+                sent=False,
             )
         ]
         await self.async_update()
@@ -226,6 +227,7 @@ class ScheduleController:
             boost.track(session)
             idle_manual = (
                 boost.kind == BOOST_MANUAL
+                and boost.sent
                 and not boosting
                 and now - datetime.fromisoformat(boost.started) > MANUAL_BOOST_GRACE
             )
@@ -245,6 +247,7 @@ class ScheduleController:
             return {
                 "state": self.decision.state,
                 "mode": self.control_mode,
+                "last_action": self.last_action,
                 "upcoming": octopus_upcoming(self.schedule, now, self.overrides),
                 "octopus": self.octopus_target,
                 "octopus_battery_kwh": self.octopus_battery,
@@ -252,6 +255,7 @@ class ScheduleController:
         return {
             "state": self.decision.state,
             "mode": self.control_mode,
+            "last_action": self.last_action,
             "run_date": self.run.date if self.run else None,
             "planned_kwh": self.run.kwh if self.run else None,
             "delivered_kwh": round(self.run.delivered, 2) if self.run else None,
@@ -277,6 +281,7 @@ class ScheduleController:
             try:
                 if stop_after_boost:
                     await self._async_set_stopped()
+                await self._async_send_boosts(now)
                 if self.octopus_mode:
                     self.run = None
                     self.decision = Decision(STATE_OCTOPUS if self.schedule["enabled"] else STATE_DISABLED)
@@ -302,33 +307,74 @@ class ScheduleController:
         if decision.charge:
             retry_due = self._last_boost_call is None or now - self._last_boost_call >= BOOST_RETRY
             if plugged and not boosting and retry_due:
+                # Set even while only switching mode, so the slot's end still puts it back to Stopped.
+                self._boost_started = True
+                if not await self._async_prepare_boost(now):
+                    return
+                if self._last_boost_call is not None:
+                    _LOGGER.warning(
+                        "The zappi didn't start boosting after the last request; asking again. "
+                        "Check the car is plugged in and accepting charge"
+                    )
                 amount = min(MAX_BOOST_KWH, max(MIN_BOOST_KWH, math.ceil(decision.remaining)))
                 self._last_boost_call = now
-                self._boost_started = True
-                _LOGGER.info("Starting scheduled boost of %s kWh", amount)
-                await self._async_ready_for_boost()
+                self._record(now, f"Scheduled boost of {amount} kWh")
                 await self._async_call(MYENERGI_DOMAIN, "myenergi_boost", {"amount": amount})
         elif self._boost_started:
             # The slot ended or the kWh are in.
             self._boost_started = False
             self._last_boost_call = None
+            self._mode_switched_at = None
             if boosting:
-                _LOGGER.info("Stopping scheduled boost (%s)", decision.state)
+                self._record(now, f"Stopped scheduled boost ({decision.state})")
                 await self._async_call(MYENERGI_DOMAIN, "myenergi_stop_boost", {})
             if self.switch_to_stopped:
                 # Otherwise the zappi carries on in Eco+ (from surplus solar) outside the slots.
                 await self._async_set_stopped()
 
-    async def _async_ready_for_boost(self) -> None:
-        """Switch to Eco+ if needed: a zappi only boosts in Eco or Eco+."""
-        if self._state(self.mode_entity) not in BOOST_MODES:
-            _LOGGER.info("Switching the zappi to Eco+ so it can boost")
-            await self._async_call("select", "select_option", {"option": "Eco+"})
+    async def _async_prepare_boost(self, now: datetime) -> bool:
+        """Whether the zappi can be sent a boost now, switching it to Eco+ first if needed.
+
+        A zappi only boosts in Eco or Eco+ and takes a while to change mode, so after switching,
+        wait MODE_SETTLE and check it reports the new mode before boosting. If it still doesn't,
+        switch again.
+        """
+        if self._mode_switched_at is not None and now - self._mode_switched_at < MODE_SETTLE:
+            return False
+        if self._state(self.mode_entity) in BOOST_MODES:
+            self._mode_switched_at = None
+            return True
+        self._mode_switched_at = now
+        self._record(now, "Switched to Eco+ to boost")
+        await self._async_call("select", "select_option", {"option": "Eco+"})
+        return False
+
+    async def _async_send_boosts(self, now: datetime) -> None:
+        """Send card boosts that were waiting for the zappi to switch to Eco+."""
+        for boost in self.boosts:
+            if boost.sent or not await self._async_prepare_boost(now):
+                continue
+            boost.sent = True
+            # The boost's clock starts when the zappi gets it.
+            boost.started = now.isoformat()
+            if boost.ready_by is not None:
+                when = datetime.fromisoformat(boost.ready_by).strftime("%H:%M")
+                self._record(now, f"Smart boost of {boost.kwh:g} kWh by {when}")
+                await self._async_call(
+                    MYENERGI_DOMAIN, "myenergi_smart_boost", {"amount": boost.kwh, "when": when}
+                )
+            else:
+                self._record(now, f"Boost of {boost.kwh:g} kWh")
+                await self._async_call(MYENERGI_DOMAIN, "myenergi_boost", {"amount": boost.kwh})
 
     async def _async_set_stopped(self) -> None:
         if self._state(self.mode_entity) not in (None, "Stopped"):
-            _LOGGER.info("Switching the zappi to Stopped")
+            self._record(dt_util.now(), "Switched to Stopped")
             await self._async_call("select", "select_option", {"option": "Stopped"})
+
+    def _record(self, now: datetime, action: str) -> None:
+        _LOGGER.info(action)
+        self.last_action = {"time": now.isoformat(timespec="seconds"), "action": action}
 
     async def _async_sync_octopus(self, now: datetime) -> None:
         """Keep Octopus's charge target and ready-by time set for the upcoming charge."""

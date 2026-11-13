@@ -365,6 +365,8 @@ class Boost:
     ready_by: str | None = None
     # Switch the zappi to Stopped once the boost is over, so charging ends at its kWh.
     stop_after: bool = False
+    # Whether the zappi has been sent it yet; it waits while the zappi switches to Eco+.
+    sent: bool = True
     delivered: float = 0.0
     last_session: float | None = None
 

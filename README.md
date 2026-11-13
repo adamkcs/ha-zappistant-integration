@@ -60,6 +60,8 @@ Zappistant runs the plan:
 
 - In each slot it starts a boost for the kWh still needed, if the car is plugged in. A zappi only
   boosts in Eco or Eco+ (it ignores a boost in Stopped or Fast), so it switches to Eco+ first if needed.
+  A zappi takes a while to change mode, so Zappistant then waits over a minute, checks the zappi
+  reports Eco+, and only then boosts (switching again if the change didn't stick).
 - At the end of a slot it stops the boost, unless that interval keeps charging after, and switches the
   zappi to Stopped (an option, on by default) so it doesn't carry on charging from surplus solar
   outside your slots. The same happens once the day's kWh are in.
@@ -75,6 +77,21 @@ Apply, Reset to the weekly plan, or Skip it (with Undo until its slots have pass
   with the run's progress and the upcoming charge as attributes
 - `switch.zappi_schedule_enabled`: turns the whole schedule on or off
 - `binary_sensor.zappi_schedule_charge_slot`: the charging plan for Predbat (below)
+
+### Troubleshooting
+
+`sensor.zappi_schedule_status` has a `last_action` attribute with what Zappistant last asked the
+zappi to do and when (e.g. "Switched to Eco+ to boost", "Scheduled boost of 21 kWh"). For the full
+story, turn on its log in `configuration.yaml` and look in Settings → System → Logs:
+
+```yaml
+logger:
+  logs:
+    custom_components.zappistant: info
+```
+
+If the zappi doesn't start boosting after a request, Zappistant logs a warning and asks again every
+5 minutes.
 
 ## Predbat
 
